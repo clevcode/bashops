@@ -1,0 +1,952 @@
+#!/usr/bin/env bash
+# Joel Eriksson <je@clevcode.org> 2024
+
+### Bashops initialization
+
+set -u # Treat references to unset variables as errors
+set -o pipefail # Treat broken pipes as errors
+set -o errtrace # Ensure our trap ERR handler is called in subshells as well
+
+shopt -s nullglob # Expand wildcards to empty string if there is no match
+
+export BASHOPS_WORKDIRS=()
+
+bashops_cleanup() {
+  local workdir
+  debug "Cleaning up ${BASHOPS_WORKDIRS[*]}"
+  for workdir in "${BASHOPS_WORKDIRS[@]}"; do
+    # Clean up if needed
+    if [ -d "$workdir" ]; then
+      # Just to be extra safe, we should only clean up mktemp -d dirs
+      case "$workdir" in
+        /tmp/*) rm -rf "$workdir" ;;
+      esac
+    fi
+  done
+}
+
+bashops_error() {
+  bold="\033[1m"
+  red="\033[0;31m"
+  nrm="\033[0m"
+  echo -e "${red}${bold}[-] Command failed: Exiting...${nrm}"
+  echo -e "${red}[-] ${BASH_SOURCE[1]}:$LINENO: $BASH_COMMAND${nrm}"
+  exit 1
+}
+
+trap bashops_error ERR
+trap bashops_cleanup EXIT
+
+export BASHOPS_VERSION=1.2
+
+### Helpers for log messages
+
+die() { echo "[E] $*" >&2; exit 1; }
+info() { echo "[I] $*" >&2; }
+warn() { echo "[W] $*" >&2; }
+error() { echo "[E] $*" >&2; }
+if [ -n "${DEBUG:-}" ]; then
+  debug() { echo "[D] $*" >&2; }
+else
+  debug() { :; }
+fi
+
+### Portable realpath, resolving symlinks etc
+
+# realpath is not guaranteed to exist on every system, and the -f option to
+# readlink is a GNU extension. So let's make our own, only relying on the
+# standard readlink-command without any options, and pwd -P which is a
+# bash builtin. Define the function body with ( ... ) instead of { ... }
+# to use a subshell, so that our working directory changes doesn't affect
+# the caller
+unrealpath() (
+  local path="$1"
+
+  # Create a global visited array if it doesn't already exist
+  if ! [[ "$(declare -p visited &>/dev/null)" =~ ^"declare -a" ]]; then
+    export visited=()
+  fi
+
+  # Squeeze any repeated slashes
+  while [[ $path == *//* ]]; do
+    path="${path//\/\///}"
+  done
+
+  # Check if the path has already been visited to prevent loops
+  for visited_path in "${visited[@]}"; do
+    [ "$path" = "$visited_path" ] && return 1
+  done
+
+  # Add the current path to the array
+  visited+=("$path")
+
+  # Read path components into an array
+  IFS=/ read -ra components <<< "$path"
+
+  # Assign to positional parameters
+  set -- "${components[@]}"
+
+  # Absolute path, so go to root directory
+  if [ -z "$1" ]; then cd /; shift; fi
+
+  # Traverse all directory components as relative paths
+  while [ $# -gt 1 ]; do
+    cd "$(pwd -P)" || return 1 # Resolve symlinks in working directory
+    cd "$1" || return 1
+    shift
+  done
+
+  # Resolve the last component
+  if [ -d "$1" ]; then
+    cd "$1" || return 1
+    pwd -P
+  elif [ -L "$1" ]; then
+    unrealpath "$(readlink "$1")"
+  elif [ -e "$1" ]; then
+    echo "$(pwd -P)/$1"
+  else
+    return 1
+  fi
+)
+
+BASHOPS_PATH="$(unrealpath "${BASH_SOURCE[0]}")"
+export BASHOPS_PATH
+
+# Helper function for scripts that source bashops
+# Within the context of the bashops script itself, BASHOPS_PATH
+basedir() {
+  local d
+  d="$(unrealpath "${BASH_SOURCE[1]}")"
+  d="${d%/*}"
+  echo "$d"
+}
+
+ensure_dir_exists() {
+  local path="$1"
+  [ -d "$path" ] || mkdir "$path"
+}
+
+ensure_executable () {
+  local path="$1"
+  [ -x "$path" ] || chmod +x "$path"
+}
+
+file_exists() {
+  local path="$1"
+  [ -f "$path" ]
+}
+
+if [ "${BASH_SOURCE[0]}" == "$0" ]; then
+  # Bashops is being executed
+  export BASHOPS_MODE=x
+else
+  # Bashops is being sourced
+  export BASHOPS_MODE=s
+fi
+
+### Helpers for initializing shells
+
+initsh_bash() {
+cat<<'EOF'
+export BASHOPS_HOME="${BASHOPS_HOME:-$HOME/.bashops}"
+[ -s "$BASHOPS_HOME/env" ] && source "$BASHOPS_HOME/env"
+for f in "$BASHOPS_HOME/cmd"/*; do
+  alias "${f##*/}"="bashops run ${f##*/}"
+done
+export PATH="$BASHOPS_HOME/bin:$PATH"
+EOF
+}
+
+eval "$(initsh_bash)"
+
+initsh() {
+  local sh="$1"
+  case "$sh" in
+    bash) initsh_bash ;;
+    *) die "Unsupported shell: $sh" ;;
+  esac
+}
+
+if [ "$BASHOPS_MODE" = x ] && [ $# -ge 1 ] && [ "$1" = initsh ]; then
+  [ $# -eq 2 ] || die "Usage: bashops initsh <shell>"
+  initsh "$2"
+  exit 0
+fi
+
+
+### Python based helpers
+
+# Usage: run_as USER [COMMAND] [ARGUMENTS...]
+run_as() {
+  local user="$1"; shift;
+  if [ $# -gt 0 ]; then
+    args=(/usr/bin/bash -ic "$(printf "%q " "$@")")
+  else
+    args=(/usr/bin/bash -l)
+  fi
+  sudo python3 - "$user" "${args[@]}" <<EOF
+import sys,os,pwd,grp
+user = sys.argv[1]
+pw=pwd.getpwnam(user)
+uid=pw.pw_uid
+gid = pw.pw_gid
+os.setgid(gid)
+os.setgroups([g.gr_gid for g in grp.getgrall() if user in g.gr_mem])
+os.setuid(uid)
+os.environ['USER'] = user
+os.environ['HOME'] = pw.pw_dir
+os.environ['LOGNAME'] = user
+os.execv(sys.argv[2],sys.argv[2:])
+EOF
+}
+
+sq3() {
+  python3 - "$@" <<EOF
+import argparse
+import sqlite3
+import json
+import sys
+
+def sq3(dbpath, query, params, fmt):
+  if not fmt: fmt = 'json'
+  try:
+    # Connect to SQLite database (or create it if it doesn't exist)
+    with sqlite3.connect(dbpath) as conn:
+      cursor = conn.cursor()
+      cursor.execute(query, params)
+      if query.strip().upper().startswith('SELECT'):
+        # Fetch column names
+        columns = [description[0] for description in cursor.description]
+        # Fetch and print all rows for a SELECT query
+        rows = cursor.fetchall()
+        for row in rows:
+          if fmt == 'raw':
+            if len(row) == 1:
+              print(row[0])
+            else:
+              print(row)
+          elif fmt == 'json': # JSON array
+            print(json.dumps(row))
+          elif fmt == 'dict': # JSON object
+            # Combine column names with row data
+            row_dict = dict(zip(columns, row))
+            print(json.dumps(row_dict))
+      else:
+        # For non-SELECT queries, commit changes
+        conn.commit()
+        #sys.stderr.write(f'SUCCESS: {cursor.rowcount} rows affected\n')
+      return True
+  except sqlite3.Error as e:
+    sys.stderr.write(f'FAILURE: Database error: {e}\n')
+  except BrokenPipeError as e:
+    return True # OK
+  except Exception as e:
+    sys.stderr.write(f'FAILURE: Error: {e}\n')
+  return False
+
+sys.argv[0] = 'sq3'
+parser = argparse.ArgumentParser()
+parser.add_argument('-r', dest='fmt', action='store_const', const='raw', help='Output format (raw)')
+parser.add_argument('-j', dest='fmt', action='store_const', const='json', help='Output format (json)')
+parser.add_argument('-d', dest='fmt', action='store_const', const='dict', help='Output format (json with column names)')
+parser.add_argument('dbpath', help='The database path')
+parser.add_argument('query', help='Parameterized SQL query (use ? in place of parameters)')
+parser.add_argument('params', help='Parameters for the SQL query', nargs='*')
+args = parser.parse_args()
+sys.exit(0 if sq3(args.dbpath, args.query, args.params, fmt=args.fmt) else 2)
+EOF
+}
+
+sq3_create() {
+  local dbpath="$1"; shift
+  local table="$1"; shift
+  local fields=("$@")
+  local query="CREATE TABLE IF NOT EXISTS $table"
+  local defs=(
+    "_id integer primary key autoincrement"
+    "_time datetime default current_timestamp"
+  )
+  for field in "${fields[@]}"; do
+    name="${field%%:*}"
+    type="${field#*:}"
+    defs+=("$name $type")
+  done
+  query="$query ($(IFS=","; echo "${defs[*]}"))"
+  sq3 "$dbpath" "$query"
+}
+
+### Directory traversal and synchronization
+
+# This recursively traverses a directory and calls a callback function
+# for each item. It does not follow symlinks, to avoid potential recursion
+# and directory traversal related issues
+traverse_dir() {
+  local DIR="$1"
+  local CMD="$2"
+  local item
+  for item in "$DIR"/* "$DIR"/.[!.]* "$DIR"/..?*; do
+    if [ -d "$item" ] && [ ! -L "$item" ]; then
+      # Directory (not a symlink)
+      "$CMD" "$item" || return $?
+      traverse_dir "$item" "$CMD" || return $?
+    else
+      # File, symlink, or other
+      $CMD "$item" || return $?
+    fi
+  done
+}
+
+# Ensure that the sync_item function is locally scoped by using
+# ( ...) instead of { ... } for the function body, since bash
+# does not have built-in support for locally scoped functions
+sync_dirs() (
+  # Don't need local scoping here since we're already in a subshell
+  SRC="$1" DST="$2"
+
+  [ -d "$SRC" ] || die "$SRC is not a directory"
+  [ -d "$DST" ] || mkdir -p "$DST"
+
+  # Resolve symlinks etc
+  SRC="$(unrealpath "$SRC")"
+  DST="$(unrealpath "$DST")"
+
+  updated=0
+  sync_item() {
+    local item="$1"
+    local rel_path="${item#"$SRC"/}"
+    local dst_path="$DST/$rel_path"
+
+    if [ -d "$item" ] && [ ! -L "$item" ]; then
+      if [ ! -d "$dst_path" ]; then
+        mkdir -p "$dst_path"
+        updated=$((updated+1))
+      fi
+    elif [ -L "$item" ]; then
+      if [ ! -L "$dst_path" ] || [ "$(readlink "$item")" != "$(readlink "$dst_path")" ]; then
+        ln -snf "$(readlink "$item")" "$dst_path"
+        updated=$((updated+1))
+      fi
+    elif [ -f "$item" ]; then
+      if [ -e "$item" ] && [ ! -f "$item" ]; then
+        die "$dst_path exists, but is not a regular file"
+      fi
+      if [ ! -e "$dst_path" ] || [ "$item" -nt "$dst_path" ]; then
+        cp -p "$item" "$dst_path"
+        updated=$((updated+1))
+      fi
+    else
+      die "Invalid file type in source directory: $item"
+    fi
+    # Need to explicitly return 0 here
+    return 0
+  }
+
+  traverse_dir "$SRC" sync_item
+  echo "$updated" # Let the caller get the number of updated items
+)
+
+### Docker helpers
+
+docker_ip() {
+  deps jq
+  docker inspect "$1"|jq -r '.[]|.NetworkSettings|.IPAddress'
+}
+
+### Other helpers
+
+# Check if command is available
+has_command() { command -v "$1" >/dev/null; }
+
+bashops_source() {
+  local path="$1"; shift
+  if [ -f "$path" ]; then
+    # shellcheck disable=SC1090
+    (source "$path")
+  elif [ -d "$path" ] && [ -f "$path/main" ]; then
+    # shellcheck disable=SC1091
+    (source "$path/main")
+  else
+    die "$path needs to either be a file, or a directory with a 'main' file"
+  fi
+  # In case persistent environment variables were added, source them
+  # into the context of the current shell, since we sourced the modules
+  # into a subshell to avoid the risk of polluting the global environment
+  source "$BASHOPS_HOME/env"
+}
+
+run() {
+  local cmd="$1"; shift
+  if [[ "$cmd" =~ / ]]; then
+    # Absolute/relative path specified
+    cmd="$(unrealpath "$cmd")"
+  else
+    # Default to using scripts under .bashops/cmd
+    cmd="$BASHOPS_HOME/cmd/$cmd"
+  fi
+  bashops_source "$cmd" "$@"
+}
+
+load() {
+  local workdir mod loaded force_load=0
+  if [ $# -ge 1 ] && [ "$1" = "-f" ]; then
+    # Support load -f to force loading the module(s) again
+    force_load=1
+    shift
+  fi
+  for mod in "$@"; do
+    loaded=
+    if [[ "$mod" =~ / ]]; then
+      # Absolute/relative path specified
+      mod="$(unrealpath "$mod")"
+    else
+      # Default to using modules under .bashops/mod
+      [ $force_load -eq 1 ] || loaded="$BASHOPS_HOME/mod/.loaded_$mod"
+      mod="$BASHOPS_HOME/mod/$mod"
+    fi
+    if [ -z "$loaded" ] || [ ! -f "$loaded" ] || [ "$loaded" -ot "$mod" ]; then
+      info "Loading bashops module ${mod##*/}..."
+      # Enter temporary working directory
+      workdir="$(mktemp -d)"
+      BASHOPS_WORKDIRS+=("$workdir")
+      enterd "$workdir"
+        bashops_source "$mod"
+        [ -z "$loaded" ] || touch "$loaded"
+      leaved
+      rm -rf "$workdir"
+      info "Loaded bashops module ${mod##*/}"
+    fi
+  done
+}
+
+# Helpers for environment variable management (updates .bashops/env)
+set_env() {
+  debug "Setting environment variable $1=$2"
+  export "$1"="$2"
+  v="${2//$HOME\//\$HOME\/}" # "De-expand" $HOME
+  p=${v//\$/\\\$} # Escape $
+  if ! grep -qE "^(export )?$1=\"?$p\"?$" "$BASHOPS_HOME/env"; then
+    echo "export $1=\"$v\"" >> "$BASHOPS_HOME/env"
+  fi
+}
+
+path_prepend() {
+  debug "Prepending to PATH: $1"
+  export "PATH=$1:$PATH"
+  v="${1//$HOME\//\$HOME\/}" # "De-expand" $HOME
+  p=${v//\$/\\\$} # Escape $
+  if ! grep -qE "^(export )?PATH=\"?$p:" "$BASHOPS_HOME/env"; then
+    echo "export PATH=\"$v:\$PATH\"" >> "$BASHOPS_HOME/env"
+  fi
+}
+
+path_append() {
+  debug "Appending to PATH: $1"
+  export "PATH=$PATH:$1"
+  v="${1//^$HOME/\$HOME}" # "De-expand" $HOME
+  p=${v//\$/\\\$} # Escape $
+  if ! grep -qE "^(export )?PATH=\"?\\\$PATH:$p" "$BASHOPS_HOME/env"; then
+    echo "export PATH=\"\$PATH:$v\"" >> "$BASHOPS_HOME/env"
+  fi
+}
+
+# Helpers for entering/leaving working directories
+enterd() {
+  #[ -d "$1" ] || mkdir "$1"
+  pushd "$1" >/dev/null || die "Enter $1 failed"
+  debug "Enter $PWD"
+}
+
+leaved() {
+  debug "Leave $PWD"
+  popd >/dev/null || die "Leave $PWD failed"
+}
+
+make_workdir() {
+  local workdir
+  workdir="$(mktemp -d)"
+  BASHOPS_WORKDIRS+=("$workdir")
+  debug "Created temporary working directory: $workdir"
+  echo "$workdir"
+}
+
+enterd_temp() {
+  local workdir
+  workdir="$(make_workdir)"
+  enterd "$workdir"
+}
+
+# Check whether the specified package is installed
+is_installed() {
+  if has_command dpkg-query; then
+    # Debian/Ubuntu
+    _is_installed() {
+      local status
+      status="$(dpkg-query -W -f='${db:Status-Status}\n' "$1"|uniq)"
+      if [ "$status" = "installed" ]; then
+        return 0
+      else
+        return 1
+        # while read -r _ p; do
+        #   _is_installed "$p" || sudo apt -y install "$p"
+        #   return 0
+        # done < <(dpkg-query -W -f='${Replaces} ${Package}\n'|sort|uniq|grep ^"$1")
+      fi
+      return 1
+    }
+  elif has_command dnf; then
+    # Fedora
+    _is_installed() { dnf list installed "$1"; }
+  elif has_command yum; then
+    # Older Red Hat/CentOS
+    _is_installed() { yum list installed "$1"; }
+  elif has_command pacman; then
+    # Arch Linux
+    _is_installed() { pacman -Q "$1"; }
+  elif has_command zypper; then
+    # openSUSE
+    _is_installed() { zypper se --installed-only "$1"; }
+  elif has_command brew; then
+    # macOS (Homebrew)
+    _is_installed() { brew list --formula "$1"; }
+  else
+    die "No recognized package manager found"
+  fi
+  is_installed() {
+    debug "Check if $1 is installed"
+    _is_installed "$1" &>/dev/null
+  }
+  is_installed "$1"
+}
+
+# Install the specified package(s)
+# Add package-name-translation as-needed
+do_install() {
+  if has_command apt-get; then
+    # Debian/Ubuntu
+    sudo apt-get -y update
+    _do_install() { sudo env DEBIAN_FRONTEND=noninteractive apt-get -y install "$@"; }
+  elif has_command dnf; then
+    # Fedora
+    sudo dnf makecache
+    _do_install() { sudo dnf -y install "$@"; }
+  elif has_command yum; then
+    # Older Red Hat/CentOS
+    sudo yum makecache
+    _do_install() { sudo yum -y install "$@"; }
+  elif has_command pacman; then
+    # Arch Linux
+    sudo pacman -Sy
+    _do_install() { sudo pacman -Sy --noconfirm "$@"; }
+  elif has_command zypper; then
+    # openSUSE
+    sudo zypper refresh
+    _do_install() { sudo zypper install -y "$@"; }
+  elif has_command brew; then
+    # macOS (Homebrew)
+    brew update
+    _do_install() { brew install "$@"; }
+  else
+    die "No recognized package manager found"
+  fi
+  do_install() {
+    if [ $# -lt 1 ]; then die "No packages specified"; fi
+    local to_install=()
+    while [ $# -gt 0 ]; do
+      is_installed "$1" || to_install+=("$1")
+      shift
+    done
+    info "Installing ${to_install[*]}"
+    _do_install "${to_install[@]}" </dev/null
+  }
+  do_install "$@"
+}
+
+
+# Ensure that the specified packages are installed
+deps() {
+  local to_install=()
+  while [ $# -gt 0 ]; do
+    grep -qw "$1" "$BASHOPS_HOME/dep" || echo "$1" >> "$BASHOPS_HOME/dep"
+    is_installed "$1" || to_install+=("$1")
+    shift
+  done
+  if [ ${#to_install[@]} -gt 0 ]; then
+    info "Installing missing dependencies: ${to_install[*]}"
+    do_install "${to_install[@]}"
+  fi
+}
+
+# Lazy resolve of the actual SHA256 verification method to use
+verify_sha256() {
+  if has_command sha256sum; then
+    _verify_sha256() { sha256sum -c - <<<"$1 *$2"; }
+  elif has_command shasum; then
+    _verify_sha256() { shasum -a 256 -c - <<<"$1 *$2"; }
+  elif has_command openssl; then
+    _verify_sha256() { local d; d=$(openssl dgst -sha256 < "$2"); [ "$1" = "${d#* }" ]; }
+  elif has_command python3; then
+    _verify_sha256() { python3 -c "import hashlib,sys;assert hashlib.sha256(open(sys.argv[2], 'rb').read()).hexdigest()==sys.argv[1]" "$@"; }
+  else
+    die "No tool available to verify SHA256 hash"
+  fi
+  verify_sha256() {
+    local file="$1" hash="$2"
+    info "Verifying SHA256:$hash..."
+    _verify_sha256 "$hash" "$file" &>/dev/null
+  }
+  verify_sha256 "$@"
+}
+
+unpack_zip() {
+  deps unzip
+  local archive="$1"
+  local dst="$2"
+  [ ! -d "$dst" ] && mkdir -p "$dst"
+  unzip -q "$archive" -d "$dst"
+  rm "$archive"
+}
+
+unpack_xz() {
+  deps xz-utils
+  local archive="$1"
+  local dst="$2"
+  local dstdir=$(dirname "$dst")
+  [ ! -d "$dstdir" ] && mkdir -p "$dstdir"
+  xz -d "$archive" --stdout > "$dst"
+  rm "$archive"
+}
+
+unpack_tar() {
+  local archive="$1"
+  local dst="$2"
+  [ ! -d "$dst" ] && mkdir -p "$dst"
+  tar -xf "$archive" -C "$dst"
+  rm "$archive"
+}
+
+# Lazy resolve of the actual fetch function to use
+fetch() {
+  if has_command curl; then
+    _fetch() {
+      local url="$1"
+      local filename="${2:-${url##*/}}"
+      curl --progress-bar -fSL -o "$filename" "$url"
+    }
+  elif has_command wget; then
+    _fetch() {
+      local url="$1"
+      local filename="${2:-${url##*/}}"
+      wget -q --show-progress -O "$filename" "$url"
+    }
+  else
+    # If neither wget or curl is installed, let's install curl
+    deps curl
+  fi
+  # Redefine the fetch function
+  fetch() {
+    if [ $# -eq 1 ]; then
+      info "Fetching $1..."
+      _fetch "$1"
+    elif [ $# -ge 2 ]; then
+      info "Fetching $1/$2..."
+      _fetch "$1/$2"
+      if [ $# -ge 3 ]; then
+        verify_sha256 "$2" "$3" || die "SHA256 verification failed"
+      fi
+    fi
+  }
+  # Call the final resolved fetch function
+  fetch "$@"
+}
+
+trim() {
+  local str="$1"
+  # Remove leading whitespace
+  str="${str#"${str%%[![:space:]]*}"}"
+  # Remove trailing whitespace
+  str="${str%"${str##*[![:space:]]}"}"
+  echo "$str"
+}
+
+# Fetch, verify and install deb package
+fetch_deb() {
+  fetch "$@"
+  local depfmt arr item file
+  # shellcheck disable=SC2016
+  depfmt='${Depends}, ${Recommends}, ${Pre-Depends}\n'
+  #depfmt='${Depends}, ${Recommends}, ${Suggests}, ${Pre-Depends}\n'
+  if [ $# -gt 1 ]; then
+    file="$2"
+  else
+    file="${1##*/}"
+  fi
+  mapfile -td, arr < <(dpkg-deb --show --showformat="$depfmt" "$file")
+  pkgs=()
+  for item in "${arr[@]}"; do
+    item="$(trim "$item")"
+    if [ -n "$item" ]; then
+      item="${item%% *}"
+      if ! is_installed "$item"; then
+        pkgs+=("$item")
+      fi
+    fi
+  done
+  deps "${pkgs[@]}"
+  info "Installing $file"
+  sudo env DEBIAN_FRONTEND=noninteractive dpkg -i "$file"
+}
+
+# Fetch, verify and unzip archive
+fetch_zip() {
+  deps unzip
+  fetch "$@"
+  unzip "$2"
+}
+
+add_user() {
+  local user="$1"
+  # Pre-mounted from host
+  if [ -d "/home/$user" ]; then
+    uid="$(stat -c %u "/home/$user")"
+    gid="$(stat -c %g "/home/$user")"
+    enterd /etc/skel; cp -na . "/home/$user"; leaved
+    sudo useradd "$user" -s /bin/bash
+    sudo groupmod -o -g "$gid" "$user"
+    sudo usermod -o -u "$uid" "$user" >/dev/null
+    sudo chown -R "$uid:$gid" "/home/$user"
+  else
+    sudo useradd -m "$user" -s /bin/bash
+  fi
+}
+
+enable_sudo() {
+  local user="$1"
+  echo "$user ALL=(ALL) NOPASSWD: ALL" | sudo tee "/etc/sudoers.d/$user" >/dev/null
+}
+
+setup_user() {
+  local user="$1"
+
+  # Add the user
+  add_user "$user"
+  enable_sudo "$user"
+
+  sudo apt-get -y update
+  sudo apt-get -y upgrade </dev/null # SIGTTOU issue
+  sudo apt-get -y dist-upgrade </dev/null
+}
+
+init() {
+  local mod dep deps
+  if [ "${1:-}" = "-f" ]; then
+    rm -f "$BASHOPS_HOME/mod/.loaded_"* || true
+  fi
+  for mod in "$BASHOPS_HOME"/mod/*; do
+    load "${mod##*/}"
+  done
+  mapfile -d$'\n' -t deps < "$BASHOPS_HOME/dep"
+  deps "${deps[@]}"
+}
+
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+  # Get the real username if run through sudo
+  USER="$SUDO_USER"
+fi
+
+if ! getent passwd "$USER" >/dev/null; then
+  # This should only happen when we're preparing a new image/environment
+  # In this case, we simply set USER before running bashops init as root
+  setup_user "$USER"
+  exec su - "$USER" bashops "$@"
+fi
+
+# Set HOME to match USER
+HOME=$(bash -c "echo ~$USER")
+export USER HOME
+
+# Polyfill based on bash-builtin command
+# Handles cases when the command is aliased, and we need the actual path
+which() { cmd="$1"; (unset "$cmd"; command -v "$cmd"); }
+
+# Aliases with the same name messes up our shell function definitions
+if [ "$(type -t sudo)" = alias ]; then
+  unalias sudo
+fi
+
+if [ "$(id -u)" = 0 ] && [ "$USER" = "root" ]; then
+  root_polyfills() {
+    local uid gid
+    uid="$(stat -c %u "$HOME")"
+    gid="$(stat -c %g "$HOME")"
+    groupmod -o -g "$gid" "$USER"
+    usermod -o -u "$uid" "$USER" >/dev/null
+    sudo() { "$@"; }
+    mktemp() { run_as "$USER" "$(which mktemp)" "$@"; }
+    mkdir() { run_as "$USER" "$(which mkdir)" "$@"; }
+    touch() { run_as "$USER" "$(which touch)" "$@"; }
+  }
+  root_polyfills
+fi
+
+export BASHOPS_HOME="${BASHOPS_HOME:-$HOME/.bashops}"
+
+# Create the initial directory structure
+[ -d "$BASHOPS_HOME" ] || mkdir "$BASHOPS_HOME"
+[ -d "$BASHOPS_HOME/pkg" ] || mkdir "$BASHOPS_HOME/pkg"
+[ -d "$BASHOPS_HOME/mod" ] || mkdir "$BASHOPS_HOME/mod"
+[ -d "$BASHOPS_HOME/cmd" ] || mkdir "$BASHOPS_HOME/cmd"
+[ -d "$BASHOPS_HOME/bin" ] || mkdir "$BASHOPS_HOME/bin"
+[ -f "$BASHOPS_HOME/env" ] || touch "$BASHOPS_HOME/env"
+[ -f "$BASHOPS_HOME/dep" ] || touch "$BASHOPS_HOME/dep"
+
+if [ ! -f "$HOME/.bashrc" ]; then
+  if [ -f /etc/skel/.bashrc ]; then
+    cp /etc/skel/.bashrc "$HOME"
+  else
+    touch "$HOME/.bashrc"
+  fi
+fi
+
+if ! grep -q 'bashops initsh' "$HOME/.bashrc"; then
+  cat >> "$HOME/.bashrc" << 'EOF'
+export PATH="$HOME/.bashops:$PATH"
+command -v bashops >/dev/null && eval "$(bashops initsh bash)"
+EOF
+fi
+
+build() {
+  if ! has_command docker; then
+    die "You need Docker to build the bashops baseimage"
+  fi
+  BASHOPS_IMAGE=clevcode/bashops
+  workdir="$(mktemp -d)"
+  BASHOPS_WORKDIRS+=("$workdir")
+  cp "${BASHOPS_PATH}" "$workdir"
+  enterd "$workdir"
+    docker build "$@" -t "$BASHOPS_IMAGE:latest" -t "$BASHOPS_IMAGE:$BASHOPS_VERSION" -f - .<<'EOF_DOCKERFILE'
+FROM ubuntu:jammy
+LABEL maintainer="Joel Eriksson <je@clevcode.org>"
+
+# Ensure that RUN blocks exit on any error
+SHELL ["bash", "-euxo", "pipefail", "-c"]
+
+# Basic system dependencies
+RUN <<EOF
+  apt-get -y update
+  apt-get -y install python3 python3-pip apt-utils sudo curl dtach locales
+  apt-get -y clean
+  rm -rf /var/lib/apt/lists/*
+EOF
+
+# Language settings
+ENV LANG en_US.UTF-8
+ENV LANGUAGE $LANG
+ENV LC_ALL $LANG
+RUN <<EOF
+  dpkg-reconfigure --frontend=noninteractive locales
+  locale-gen $LANG
+  update-locale LANG=$LANG
+EOF
+
+# Setup bashops user with sudo access
+RUN <<EOF
+  useradd -r -m bashops -s /bin/bash
+  echo "bashops ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/bashops
+EOF
+
+# Install the bashops helper script
+COPY --chmod=0755 bashops /usr/bin/bashops
+EOF_DOCKERFILE
+  leaved
+  rm -rf "$workdir"
+}
+
+enter() {
+  if ! has_command docker; then
+    die "You need Docker to run the bashops baseimage"
+  fi
+  BASHOPS_IMAGE=clevcode/bashops
+  if [ -z "$(docker images -q "$BASHOPS_IMAGE:$BASHOPS_VERSION")" ]; then
+    local extra_build_args=()
+    build "${extra_build_args[@]}"
+  fi
+  docker run -it --rm -v "$PWD:/home/bashops" "$BASHOPS_IMAGE:$BASHOPS_VERSION" su - bashops
+}
+
+# Validate names of bashops modules/commands/packages
+#
+# I.e. words and/or version numbers separated with dashes
+valid_bashops_name() {
+  local name="$1"
+  word="[a-z]+"
+  numb="[0-9]+"
+  vers="$numb(\.$numb)*"
+  [[ "$name" =~ ^$word((-$word)|(-$vers))*$ ]]
+}
+
+install_bashops_package() {
+  local pkg name dst nsync n
+
+  pkg="$(unrealpath "$1")"
+
+  # Bashops package directories must contain a .bashpkg file with the package name
+  [ -f "$pkg/.bashpkg" ] || die "$pkg is not a valid Bashops package directory"
+
+  # Read and validate the package name
+  name="$(< "$pkg/.bashpkg")"
+  valid_bashops_name "$name" || die "$name is not a valid Bashops package name"
+
+  dst="$BASHOPS_HOME/pkg/$name"
+  [ -d "$dst" ] || mkdir -p "$dst"
+  nsync=0
+  info "Installing Bashops package $name..."
+  for dir in mod cmd; do
+    if [ -d "$pkg/$dir" ]; then
+      n="$(sync_dirs "$pkg/$dir" "$dst/$dir")"
+      nsync=$((nsync+n))
+      enterd "$dst/$dir"
+        for f in *; do
+          ln -s "../pkg/$name/$dir/$f" "../../../$dir/$f"
+          info "Added Bashops $dir $f"
+        done
+      leaved
+    fi
+  done
+}
+
+install() {
+  # Installing/update the current bashops installation, if needed
+  # BASHOPS_PATH = The path to this script
+  # BASHOPS_HOME = ~/.bashops by default
+  [ "$BASHOPS_PATH" = "$BASHOPS_HOME/bashops" ] || cp "$BASHOPS_PATH" "$BASHOPS_HOME"
+  [ -x "$BASHOPS_HOME/bashops" ] || chmod 700 "$BASHOPS_HOME/bashops"
+
+  # Add a bashops symlink to ~/.local/bin, the XDG standard directory
+  # for user-specific executables. Prepend this directory to the PATH
+  # if it's not already added
+  [ -d ~/.local/bin ] || mkdir -p ~/.local/bin
+  [[ ":$PATH:" == *":$HOME/.local/bin:"* ]] || path_prepend '$HOME/.local/bin'
+  ln -sf "$BASHOPS_HOME/bashops" ~/.local/bin
+
+  # If additional arguments are specified, they are interpreted as paths
+  # to Bashops packages.
+  for pkg in "$@"; do
+    install_bashops_package "$pkg"
+  done
+
+  # If we run bashops install within a bashops package directory, install it
+  [ ! -f .bashpkg ] || install_bashops_package .
+
+  # Load any new/updated bashops modules
+  init
+}
+
+deploy() {
+  [ $# -ge 1 ] || die "Usage: bashops deploy [SSH-OPTIONS...] HOST"
+  n=bashops;ssh "$@" bash -c "'([ -d .$n ]||mkdir .$n)&&cd .$n&&cat>$n&&chmod 700 $n&&./$n install'"<"${BASH_SOURCE[0]}"
+}
+
+if [ "$BASHOPS_MODE" = x ]; then
+  # Only do this when we're executed, not sourced
+  "$@"
+fi

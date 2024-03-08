@@ -1,0 +1,6 @@
+pkg/
+mod/
+cmd/
+bin/
+env/
+dep/
