@@ -906,12 +906,21 @@ install_bashops_package() {
       nsync=$((nsync+n))
       enterd "$dst/$dir"
         for f in *; do
-          ln -s "../pkg/$name/$dir/$f" "../../../$dir/$f"
+          ln -snf "../pkg/$name/$dir/$f" "../../../$dir/$f"
           info "Added Bashops $dir $f"
         done
       leaved
     fi
   done
+}
+
+update() {
+  if [ -d "$BASHOPS_HOME/.git" ]; then
+    git -C "$BASHOPS_HOME" pull
+  else
+    deps curl
+    curl https://raw.githubusercontent.com/clevcode/bashops/main/bashops > "$BASHOPS_PATH"
+  fi
 }
 
 install() {
