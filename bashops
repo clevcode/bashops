@@ -946,6 +946,12 @@ install() {
   # If we run bashops install within a bashops package directory, install it
   [ ! -f .bashpkg ] || install_bashops_package .
 
+  # If we are installing Bashops from a package directory, install the package as well
+  if [ "$BASHOPS_PATH" != "$BASHOPS_HOME/bashops" ]; then
+    pkgdir="$(dirname "$(unrealpath "$BASHOPS_PATH")")"
+    [ ! -f "$pkgdir/.bashpkg" ] || install_bashops_package "$pkgdir"
+  fi
+
   # Load any new/updated bashops modules
   init
 }
@@ -956,6 +962,10 @@ deploy() {
 }
 
 if [ "$BASHOPS_MODE" = x ]; then
-  # Only do this when we're executed, not sourced
-  "$@"
+  if [ $# -ge 1 ]; then
+    # Only do this when we're executed, not sourced
+    "$@"
+  else
+    install
+  fi
 fi
