@@ -131,7 +131,7 @@ basedir() {
 
 ensure_dir_exists() {
   local path="$1"
-  [ -d "$path" ] || mkdir "$path"
+  [ -d "$path" ] || mkdir -p "$path"
 }
 
 ensure_executable() {
@@ -347,9 +347,17 @@ sync_dirs() (
 
 ### Docker helpers
 
+# Get IP of Docker container
+# Usage: docker_ip CONTAINER_ID
 docker_ip() {
   deps jq
   docker inspect "$1"|jq -r '.[]|.NetworkSettings|.IPAddress'
+}
+
+# Get container ID(s) for container instances of Docker image
+# Usage: docker_id IMAGE_NAME
+docker_id() {
+  docker ps | awk '$2 == "'"$1"'" { print $1 }'
 }
 
 ### Other helpers
@@ -408,10 +416,10 @@ load() {
       # Enter temporary working directory
       workdir="$(mktemp -d)"
       BASHOPS_WORKDIRS+=("$workdir")
-      enterd "$workdir"
+      enter "$workdir"
         bashops_source "$mod"
         [ -z "$loaded" ] || touch "$loaded"
-      leaved
+      leave
       rm -rf "$workdir"
       info "Loaded bashops module ${mod##*/}"
     fi
@@ -450,13 +458,13 @@ path_append() {
 }
 
 # Helpers for entering/leaving working directories
-enterd() {
+enter() {
   #[ -d "$1" ] || mkdir "$1"
   pushd "$1" >/dev/null || die "Enter $1 failed"
   debug "Enter $PWD"
 }
 
-leaved() {
+leave() {
   debug "Leave $PWD"
   popd >/dev/null || die "Leave $PWD failed"
 }
@@ -472,10 +480,10 @@ make_workdir() {
   echo "$workdir"
 }
 
-enterd_temp() {
+enter_temp() {
   local workdir
   workdir="$(make_workdir)"
-  enterd "$workdir"
+  enter "$workdir"
 }
 
 # Check whether the specified package is installed
@@ -709,6 +717,7 @@ fetch_deb() {
     item="$(trim "$item")"
     if [ -n "$item" ]; then
       item="${item%% *}"
+      item="${item%%:any}"
       if ! is_installed "$item"; then
         pkgs+=("$item")
       fi
@@ -732,7 +741,7 @@ add_user() {
   if [ -d "/home/$user" ]; then
     uid="$(stat -c %u "/home/$user")"
     gid="$(stat -c %g "/home/$user")"
-    enterd /etc/skel; cp -na . "/home/$user"; leaved
+    enter /etc/skel; cp -na . "/home/$user"; leave
     sudo useradd "$user" -s /bin/bash
     sudo groupmod -o -g "$gid" "$user"
     sudo usermod -o -u "$uid" "$user" >/dev/null
@@ -845,7 +854,7 @@ build() {
   workdir="$(mktemp -d)"
   BASHOPS_WORKDIRS+=("$workdir")
   cp "${BASHOPS_PATH}" "$workdir"
-  enterd "$workdir"
+  enter "$workdir"
     docker build "$@" -t "$BASHOPS_IMAGE:latest" -t "$BASHOPS_IMAGE:$BASHOPS_VERSION" -f - .<<'EOF_DOCKERFILE'
 FROM ubuntu:jammy
 LABEL maintainer="Joel Eriksson <je@clevcode.org>"
@@ -879,21 +888,13 @@ EOF
 
 # Install the bashops helper script
 COPY --chmod=0755 bashops /usr/bin/bashops
-EOF_DOCKERFILE
-  leaved
-  rm -rf "$workdir"
-}
 
-enter() {
-  if ! has_command docker; then
-    die "You need Docker to run the bashops baseimage"
-  fi
-  BASHOPS_IMAGE=clevcode/bashops
-  if [ -z "$(docker images -q "$BASHOPS_IMAGE:$BASHOPS_VERSION")" ]; then
-    local extra_build_args=()
-    build "${extra_build_args[@]}"
-  fi
-  docker run -it --rm -v "$PWD:/home/bashops" "$BASHOPS_IMAGE:$BASHOPS_VERSION" su - bashops
+ENV USER bashops
+ENV HOME /home/bashops
+USER bashops
+EOF_DOCKERFILE
+  leave
+  rm -rf "$workdir"
 }
 
 # Validate names of bashops modules/commands/packages
@@ -927,12 +928,12 @@ install_bashops_package() {
     if [ -d "$pkg/$dir" ]; then
       n="$(sync_dirs "$pkg/$dir" "$dst/$dir")"
       nsync=$((nsync+n))
-      enterd "$dst/$dir"
+      enter "$dst/$dir"
         for f in *; do
           ln -snf "../pkg/$name/$dir/$f" "../../../$dir/$f"
           info "Added Bashops $dir $f"
         done
-      leaved
+      leave
     fi
   done
 }
