@@ -943,7 +943,7 @@ update() {
     git -C "$BASHOPS_HOME" pull
   else
     deps curl
-    curl https://raw.githubusercontent.com/clevcode/bashops/main/bashops > "$BASHOPS_PATH"
+    curl -s --progress-bar -fSL https://raw.githubusercontent.com/clevcode/bashops/main/bashops > "$BASHOPS_PATH"
   fi
 }
 
