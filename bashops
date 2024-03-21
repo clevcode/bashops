@@ -469,8 +469,9 @@ leave() {
   popd >/dev/null || die "Leave $PWD failed"
 }
 
-enter() { enterd "$@"; }
-leave() { leaved; }
+# Deprecated aliases
+enterd() { enter "$@"; }
+leaved() { leave; }
 
 make_workdir() {
   local workdir
