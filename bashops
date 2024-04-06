@@ -130,8 +130,14 @@ basedir() {
 }
 
 ensure_dir_exists() {
-  local path="$1"
-  [ -d "$path" ] || mkdir -p "$path"
+  local path
+  for path in "$@"; do
+    [ -d "$path" ] || mkdir -p "$path"
+  done
+}
+
+ensure_dirs_exist() {
+  ensure_dir_exists "$@"
 }
 
 ensure_executable() {
