@@ -356,8 +356,7 @@ sync_dirs() (
 # Get IP of Docker container
 # Usage: docker_ip CONTAINER_ID
 docker_ip() {
-  deps jq
-  docker inspect "$1"|jq -r '.[]|.NetworkSettings|.IPAddress'
+  docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"
 }
 
 # Get container ID(s) for container instances of Docker image
