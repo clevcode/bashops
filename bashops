@@ -37,7 +37,7 @@ bashops_error() {
 trap bashops_error ERR
 trap bashops_cleanup EXIT
 
-export BASHOPS_VERSION=1.3
+export BASHOPS_VERSION=1.4
 
 if [ "${BASH_SOURCE[0]}" == "$0" ]; then
   # Bashops is being executed
@@ -540,7 +540,7 @@ is_installed() {
 do_install() {
   if has_command apt-get; then
     # Debian/Ubuntu
-    sudo apt-get -y update
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get -y update
     _do_install() { sudo env DEBIAN_FRONTEND=noninteractive apt-get -y install "$@"; }
   elif has_command dnf; then
     # Fedora
@@ -769,9 +769,9 @@ setup_user() {
   add_user "$user"
   enable_sudo "$user"
 
-  sudo apt-get -y update
-  sudo apt-get -y upgrade </dev/null # SIGTTOU issue
-  sudo apt-get -y dist-upgrade </dev/null
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get -y update
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get -y upgrade </dev/null # SIGTTOU issue
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get -y dist-upgrade </dev/null
 }
 
 init() {
@@ -870,6 +870,7 @@ SHELL ["bash", "-euxo", "pipefail", "-c"]
 
 # Basic system dependencies
 RUN <<EOF
+  export DEBIAN_FRONTEND=noninteractive
   apt-get -y update
   apt-get -y install python3 python3-pip apt-utils sudo curl tmux locales
   apt-get -y clean
@@ -881,6 +882,7 @@ ENV LANG en_US.UTF-8
 ENV LANGUAGE $LANG
 ENV LC_ALL $LANG
 RUN <<EOF
+  export DEBIAN_FRONTEND=noninteractive
   dpkg-reconfigure --frontend=noninteractive locales
   locale-gen $LANG
   update-locale LANG=$LANG
@@ -899,6 +901,7 @@ COPY --chmod=0755 bashops /usr/bin/bashops
 COPY --chmod=0755 <<"EOF" /enter
 #!/bin/bash
 set -e
+[ -f /.user ] && BASHOPS_USER="$(cat /.user)" || BASHOPS_USER=bashops
 fix_user_uid() {
   local user="$1"
   local uid="$2"
@@ -920,13 +923,16 @@ rename_user() {
     sudo mv "/home/$user" "/home/$new_name"
   fi
 }
-[ "$USER_UID" = "" ] || fix_user_uid bashops "$USER_UID"
-[ "$USER_GID" = "" ] || fix_user_gid bashops "$USER_GID"
-[ "$USER_NAME" != "" ] || USER_NAME=bashops
-if [ "$USER_NAME" != bashops ]; then
-  rename_user bashops "$USER_NAME"
-  sudo rm /etc/sudoers.d/bashops
-  echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee "/etc/sudoers.d/$USER_NAME" >/dev/null
+[ "$USER_UID" = "" ] || fix_user_uid "$BASHOPS_USER" "$USER_UID"
+[ "$USER_GID" = "" ] || fix_user_gid "$BASHOPS_USER" "$USER_GID"
+[ "$USER_NAME" != "" ] || USER_NAME="$BASHOPS_USER"
+if [ "$USER_NAME" != "$BASHOPS_USER" ]; then
+  rename_user "$BASHOPS_USER" "$USER_NAME"
+  echo "$USER_NAME" | sudo tee /.user >/dev/null
+  if [ -f "/etc/sudoers.d/$BASHOPS_USER" ]; then
+    sudo rm "/etc/sudoers.d/$BASHOPS_USER"
+    echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee "/etc/sudoers.d/$USER_NAME" >/dev/null
+  fi
 fi
 if [ "$SUPP_GROUPS" != "" ]; then
   for g in $SUPP_GROUPS; do
@@ -945,7 +951,10 @@ fi
 # Just chown the original /etc/skel stuff, just in case the user has -v:ed in
 # something else into the home directory
 chown "$(id -u "$USER_NAME")":"$(id -g "$USER_NAME")" "/home/$USER_NAME"/{.,.bash_logout,.bashrc,.profile}
-[ "$NOEXEC" = "" ] || exit 0
+if [ "$FIXUP" != "" ]; then
+  #(echo '#!/bin/bash';echo exec su -l - "$USER_NAME" '"$@"')>/enter
+  exit 0
+fi
 exec su -l - "$USER_NAME" "$@"
 EOF
 
@@ -989,8 +998,8 @@ install_bashops_package() {
       nsync=$((nsync+n))
       enter "$dst/$dir"
         for f in *; do
-          ln -snf "../pkg/$name/$dir/$f" "../../../$dir/$f"
-          info "Added Bashops $dir $f"
+          ln -snf "../pkg/$name/$dir/$f" "../../../$dir/$name-$f"
+          info "Added Bashops $dir $name-$f"
         done
       leave
     fi
